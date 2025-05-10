@@ -1,119 +1,105 @@
-let map = L.map('map').setView([51.505, -0.09], 13);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  attribution: '&copy; OpenStreetMap contributors'
-}).addTo(map);
+// script.js
 
-let graph, nodeMarkers = {}, selected = [], routePolyline;
+let graph = null;           // adjacency list from mugla_graph.json
+let positions = null;       // node id => {lat, lon}
+let map = null;
+let startNode = null, endNode = null;
+let startMarker = null, endMarker = null, routeLine = null;
 
-// Load the graph data (nodes, edges, coordinates)
-fetch('graph-data.json')
+function getClosestNode(latlng, positions) {
+  let minDist = Infinity, closest = null;
+  for (let node in positions) {
+    const dLat = latlng.lat - positions[node].lat;
+    const dLon = latlng.lng - positions[node].lon;
+    const dist = dLat * dLat + dLon * dLon; // Fast, sufficient for small area
+    if (dist < minDist) {
+      minDist = dist;
+      closest = node;
+    }
+  }
+  return closest;
+}
+
+function updateInfo(msg) {
+  document.getElementById('info').textContent = msg;
+}
+
+function resetState() {
+  if (startMarker) map.removeLayer(startMarker);
+  if (endMarker) map.removeLayer(endMarker);
+  if (routeLine) map.removeLayer(routeLine);
+  startMarker = endMarker = routeLine = null;
+  startNode = endNode = null;
+  updateInfo("Click two points on the map to select start and end.");
+}
+
+fetch('mugla_graph.json')
   .then(res => res.json())
   .then(data => {
-    graph = data;
-    for (let node of graph.nodes) {
-      let [lat, lng] = graph.coordinates[node];
-      nodeMarkers[node] = L.marker([lat, lng]).addTo(map).bindPopup(`Node: ${node}`);
-    }
-    updateStatus();
+    graph = data.edges;
+    positions = data.positions;
+    initializeMap();
+  })
+  .catch((err) => {
+    alert("Couldn't load Muğla road network!");
+    console.error(err);
   });
 
-// Show user what to do next
-function updateStatus() {
-    let status = document.getElementById("status");
-    if (selected.length === 0)
-        status.innerHTML = "Select the <b>start node</b> (1st node).";
-    else if (selected.length === 1)
-        status.innerHTML = `Start: <b>${selected[0]}</b><br>Select the <b>end node</b> (2nd node).`;
-    else if (selected.length === 2)
-        status.innerHTML = `Start: <b>${selected[0]}</b>, End: <b>${selected[1]}</b>`;
+function initializeMap() {
+  // Muğla approximate center (city level, fine tune for your needs)
+  map = L.map('map').setView([37.2159, 28.3636], 10);
+
+  // OSM tiles
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap contributors'
+  }).addTo(map);
+
+  map.on('click', function(e) {
+    if (!graph || !positions) {
+      updateInfo("Graph data not loaded yet.");
+      return;
+    }
+    if (!startNode) {
+      startNode = getClosestNode(e.latlng, positions);
+      const pos = positions[startNode];
+      startMarker = L.marker([pos.lat, pos.lon], {icon: L.icon({
+        iconUrl:"https://unpkg.com/leaflet@1.7.1/dist/images/marker-icon.png", iconAnchor:[12, 41]
+      })}).bindPopup("Start").addTo(map).openPopup();
+      updateInfo("Start selected. Click to select end point.");
+    } else if (!endNode) {
+      endNode = getClosestNode(e.latlng, positions);
+      const pos = positions[endNode];
+      endMarker = L.marker([pos.lat, pos.lon], {icon: L.icon({
+        iconUrl:"https://unpkg.com/leaflet@1.7.1/dist/images/marker-icon-red.png", iconAnchor:[12,41]
+      })}).bindPopup("End").addTo(map).openPopup();
+      updateInfo("Calculating shortest path...");
+      setTimeout(() => {
+        calculateAndDrawRoute();
+      }, 100);
+    }
+  });
+
+  document.getElementById('reset-btn').addEventListener('click', resetState);
+
+  resetState();
 }
 
-// Map click handler to select nodes
-map.on('click', function(e) {
-  if (!graph) return;
-  // Find nearest node
-  let nearest = null, minDist = Infinity;
-  for (let node of graph.nodes) {
-    let [lat, lng] = graph.coordinates[node];
-    let d = Math.sqrt(Math.pow(lat - e.latlng.lat, 2) + Math.pow(lng - e.latlng.lng, 2));
-    if (d < minDist) {
-      minDist = d;
-      nearest = node;
-    }
+function calculateAndDrawRoute() {
+  if (!startNode || !endNode) return;
+  if (startNode === endNode) {
+    updateInfo("Start and End are the same point!");
+    return;
   }
-  if (!nearest) return;
-  // Only allow selecting two unique nodes
-  if (!selected.includes(nearest)) {
-    selected.push(nearest);
-    nodeMarkers[nearest].openPopup();
-    updateStatus();
+  const result = dijkstra(graph, startNode, endNode);
+  if (!result.path || result.path.length < 2) {
+    updateInfo("No path found between selected points.");
+    return;
   }
-  // If two nodes selected, run and show path:
-  if (selected.length === 2) {
-    findRoute(selected[0], selected[1]);
-  }
-});
-
-function findRoute(start, end) {
-  let result = dijkstra(graph, start, end);
-  let latlngs = result.path.map(node => graph.coordinates[node]);
-  if (routePolyline) routePolyline.remove();
-  if(latlngs.length > 1) {
-    routePolyline = L.polyline(latlngs, { color: 'red', weight: 6 }).addTo(map);
-    map.fitBounds(routePolyline.getBounds());
-    alert(`Shortest path from ${start} to ${end}:\n${result.path.join(' ➔ ')}\nTotal Distance: ${result.distance}`);
-  } else {
-    alert(`No path found from ${start} to ${end}.`);
-  }
-  selected = [];
-  updateStatus();
+  // Draw polyline
+  const pathLatLngs = result.path.map(n => [positions[n].lat, positions[n].lon]);
+  if (routeLine) map.removeLayer(routeLine);
+  routeLine = L.polyline(pathLatLngs, {color: 'red', weight: 5}).addTo(map);
+  map.fitBounds(routeLine.getBounds(), { padding: [60,60] });
+  let dist_km = result.distance / 1000;
+  updateInfo(`Shortest path found! Distance: ${dist_km.toFixed(2)} km. Click reset to try new points.`);
 }
-
-// Dijkstra's algorithm implementation
-function dijkstra(graph, start, end) {
-  const distances = {};
-  const prev = {};
-  const nodes = new Set(graph.nodes);
-
-  for (let node of graph.nodes) {
-    distances[node] = Infinity;
-    prev[node] = null;
-  }
-  distances[start] = 0;
-
-  while (nodes.size > 0) {
-    let u = null;
-    for (let node of nodes) {
-      if (u === null || distances[node] < distances[u]) u = node;
-    }
-    if (distances[u] === Infinity || u === end) break;
-    nodes.delete(u);
-    for (let neighbor of graph.edges[u]) {
-      let alt = distances[u] + neighbor.weight;
-      if (alt < distances[neighbor.node]) {
-        distances[neighbor.node] = alt;
-        prev[neighbor.node] = u;
-      }
-    }
-  }
-
-  // Reconstruct shortest path
-  let path = [], u = end;
-  if (prev[u] || u === start) {
-    while (u) {
-      path.unshift(u);
-      u = prev[u];
-    }
-  }
-  return { path: path, distance: distances[end] };
-}
-
-// Reset button
-document.getElementById('reset-btn').onclick = function() {
-  selected = [];
-  if (routePolyline) {
-    routePolyline.remove();
-    routePolyline = null;
-  }
-  updateStatus();
-};
